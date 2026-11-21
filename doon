@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+doon - Download/clone all GitHub repositories from an organization or user.
+Colored and emojified version!
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+DEFAULT_DEST = "/Users/mohsen/git"
+
+# ANSI Color Codes
+class Color:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN = "\033[96m"
+    WHITE = "\033[97m"
+    BG_CYAN = "\033[46m"
+    BG_BLUE = "\033[44m"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="doon",
+        description="🚀 Download/clone all GitHub repositories with style!",
+    )
+    parser.add_argument(
+        "target",
+        help="GitHub URL (e.g., https://github.com/nextcloud) or username/organization name",
+    )
+    parser.add_argument(
+        "-d",
+        "--dest",
+        default=DEFAULT_DEST,
+        help=f"Target directory to save repositories (default: {DEFAULT_DEST})",
+    )
+    parser.add_argument(
+        "-t",
+        "--token",
+        default=os.environ.get("GITHUB_TOKEN"),
+        help="GitHub Personal Access Token (defaults to GITHUB_TOKEN environment variable)",
+    )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Automatically confirm and start download without asking",
+    )
+    return parser.parse_args()
+
+
+def extract_owner(target_str: str) -> str:
+    target = target_str.strip().rstrip("/")
+    for prefix in ("https://github.com/", "http://github.com/", "github.com/"):
+        if target.startswith(prefix):
+            target = target[len(prefix) :]
+            break
+    owner = target.split("/")[0].strip()
+    if not owner:
+        print(f"{Color.RED}❌ Error: Could not extract GitHub username/organization from '{target_str}'.{Color.RESET}", file=sys.stderr)
+        sys.exit(1)
+    return owner
+
+
+def format_size(kb: int) -> str:
+    if kb < 1024:
+        return f"{kb} KB"
+    mb = kb / 1024.0
+    if mb < 1024:
+        return f"{mb:.2f} MB"
+    gb = mb / 1024.0
+    return f"{gb:.2f} GB"
+
+
+def make_request(url: str, token: str | None = None) -> dict | list:
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", "doon-cli")
+    req.add_header("Accept", "application/vnd.github+json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8")
+            err_data = json.loads(body)
+            msg = err_data.get("message", body)
+        except Exception:
+            msg = body or str(e)
+
+        if e.code == 404:
+            print(f"{Color.RED}❌ Error: GitHub user/organization not found (HTTP 404).{Color.RESET}", file=sys.stderr)
+        elif e.code == 403 and "rate limit" in msg.lower():
+            print(
+                f"\n{Color.YELLOW}⚠️  GitHub API rate limit exceeded!{Color.RESET}\n"
+                f"{Color.CYAN}💡 Pro-tip: Set a Personal Access Token to unlock 5,000 requests/hour:{Color.RESET}\n"
+                f"   {Color.BOLD}export GITHUB_TOKEN=\"your_token\"{Color.RESET}\n"
+                f"   {Color.BOLD}doon {url}{Color.RESET}\n",
+                file=sys.stderr,
+            )
+        else:
+            print(f"{Color.RED}❌ Error ({e.code}) fetching {url}: {msg}{Color.RESET}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"{Color.RED}❌ Network error: {e}{Color.RESET}", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_all_repositories(owner: str, token: str | None = None) -> list[dict]:
+    user_info = make_request(f"https://api.github.com/users/{owner}", token)
+    entity_type = user_info.get("type", "User")
+    is_org = entity_type.lower() == "organization"
+    entity_emoji = "🏢" if is_org else "👤"
+
+    print(f"{Color.BOLD}{entity_emoji} Account:{Color.RESET}     {Color.CYAN}{owner}{Color.RESET} {Color.DIM}({entity_type}){Color.RESET}")
+    print(f"{Color.YELLOW}🔍 Scanning repositories on GitHub...{Color.RESET}")
+
+    repos = []
+    page = 1
+    per_page = 100
+
+    while True:
+        if is_org:
+            api_url = f"https://api.github.com/orgs/{owner}/repos?per_page={per_page}&page={page}&type=public"
+        else:
+            api_url = f"https://api.github.com/users/{owner}/repos?per_page={per_page}&page={page}&type=owner"
+
+        page_data = make_request(api_url, token)
+        if not page_data:
+            break
+
+        repos.extend(page_data)
+        print(f"   {Color.DIM}↳ Page {page}: fetched {len(page_data)} repos (total so far: {len(repos)}){Color.RESET}")
+
+        if len(page_data) < per_page:
+            break
+        page += 1
+
+    return repos
+
+
+def sync_repo(repo: dict, destination_dir: Path):
+    name = repo["name"]
+    clone_url = repo["clone_url"]
+    repo_path = destination_dir / name
+
+    if repo_path.is_dir() and (repo_path / ".git").is_dir():
+        print(f"   {Color.BLUE}🔄 Local folder exists. Running 'git pull'...{Color.RESET}")
+        cmd = ["git", "-C", str(repo_path), "pull", "--ff-only"]
+    else:
+        print(f"   {Color.CYAN}⬇️  Cloning {clone_url}...{Color.RESET}")
+        cmd = ["git", "clone", "--quiet", clone_url, str(repo_path)]
+
+    result = subprocess.run(cmd)
+    if result.returncode == 0:
+        print(f"   {Color.GREEN}✨ Done!{Color.RESET}")
+    else:
+        print(f"   {Color.YELLOW}⚠️  Git command finished with warning/code {result.returncode}{Color.RESET}", file=sys.stderr)
+
+
+def main():
+    args = parse_args()
+    owner = extract_owner(args.target)
+    dest_path = Path(args.dest).expanduser().resolve()
+    dest_path.mkdir(parents=True, exist_ok=True)
+
+    print()
+    print(f"{Color.BOLD}{Color.MAGENTA}✨ 🚀 DOON — GITHUB DOWNLOADER 🚀 ✨{Color.RESET}")
+    print(f"{Color.DIM}{'─' * 58}{Color.RESET}")
+    print(f"{Color.BOLD}🎯 Target:{Color.RESET}      {Color.WHITE}{args.target}{Color.RESET}")
+    print(f"{Color.BOLD}📂 Destination:{Color.RESET} {Color.GREEN}{dest_path}{Color.RESET}")
+    print(f"{Color.DIM}{'─' * 58}{Color.RESET}")
+
+    repos = get_all_repositories(owner, args.token)
+    total = len(repos)
+
+    if total == 0:
+        print(f"\n{Color.YELLOW}⚠️  No public repositories found for '{owner}'.{Color.RESET}")
+        return
+
+    # Calculate sizes
+    total_size_kb = 0
+    new_repos_count = 0
+    new_repos_size_kb = 0
+    existing_repos_count = 0
+    existing_repos_size_kb = 0
+
+    for r in repos:
+        size_kb = r.get("size", 0)
+        total_size_kb += size_kb
+        repo_path = dest_path / r["name"]
+        if repo_path.is_dir() and (repo_path / ".git").is_dir():
+            existing_repos_count += 1
+            existing_repos_size_kb += size_kb
+        else:
+            new_repos_count += 1
+            new_repos_size_kb += size_kb
+
+    # Summary Card
+    print()
+    print(f"{Color.CYAN}┌{'─' * 56}┐{Color.RESET}")
+    print(f"{Color.CYAN}│{Color.RESET}  {Color.BOLD}📊 DOWNLOAD SUMMARY{Color.RESET}{' ' * 36}{Color.CYAN}│{Color.RESET}")
+    print(f"{Color.CYAN}├{'─' * 56}┤{Color.RESET}")
+    print(f"{Color.CYAN}│{Color.RESET}  🎯 Account:               {Color.BOLD}{owner:<30}{Color.RESET}{Color.CYAN}│{Color.RESET}")
+    print(f"{Color.CYAN}│{Color.RESET}  📦 Total Repositories:    {Color.BOLD}{total:<30}{Color.RESET}{Color.CYAN}│{Color.RESET}")
+    print(f"{Color.CYAN}│{Color.RESET}  ⬇️  To Clone (new):        {Color.GREEN}{new_repos_count} ({format_size(new_repos_size_kb)}){Color.RESET}{' ' * max(0, 30 - len(f'{new_repos_count} ({format_size(new_repos_size_kb)})'))}{Color.CYAN}│{Color.RESET}")
+    print(f"{Color.CYAN}│{Color.RESET}  🔄 Already Present (pull):{Color.BLUE}{existing_repos_count} ({format_size(existing_repos_size_kb)}){Color.RESET}{' ' * max(0, 30 - len(f'{existing_repos_count} ({format_size(existing_repos_size_kb)})'))}{Color.CYAN}│{Color.RESET}")
+    print(f"{Color.CYAN}├{'─' * 56}┤{Color.RESET}")
+    total_size_str = f"~{format_size(total_size_kb)}"
+    print(f"{Color.CYAN}│{Color.RESET}  💾 {Color.BOLD}Total Estimated Size:  {Color.YELLOW}{total_size_str}{Color.RESET}{' ' * max(0, 30 - len(total_size_str))}{Color.CYAN}│{Color.RESET}")
+    print(f"{Color.CYAN}└{'─' * 56}┘{Color.RESET}")
+
+    # Confirmation
+    if not args.yes:
+        try:
+            prompt_text = f"\n{Color.BOLD}{Color.YELLOW}❓ Do you want to proceed with downloading? [y/N]: {Color.RESET}"
+            choice = input(prompt_text).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n{Color.RED}❌ Aborted.{Color.RESET}")
+            sys.exit(0)
+
+        if choice not in ("y", "yes"):
+            print(f"{Color.RED}🛑 Download cancelled by user. Goodbye! 👋{Color.RESET}")
+            sys.exit(0)
+
+    print(f"\n{Color.BOLD}{Color.GREEN}🚀 Starting download process...{Color.RESET}\n")
+
+    for idx, repo in enumerate(repos, start=1):
+        name = repo["name"]
+        size_str = format_size(repo.get("size", 0))
+        archived_tag = f" {Color.DIM}[📦 Archived]{Color.RESET}" if repo.get("archived") else ""
+        print(f"{Color.BOLD}[{idx}/{total}]{Color.RESET} 📦 {Color.WHITE}{Color.BOLD}{name}{Color.RESET} {Color.CYAN}({size_str}){Color.RESET}{archived_tag}")
+        sync_repo(repo, dest_path)
+        print()
+
+    print(f"{Color.GREEN}{'═' * 58}{Color.RESET}")
+    print(f"🎉 {Color.BOLD}{Color.GREEN}All {total} repositories successfully synced to {dest_path}!{Color.RESET} ✨")
+    print(f"{Color.GREEN}{'═' * 58}{Color.RESET}\n")
+
+
+if __name__ == "__main__":
+    main()
